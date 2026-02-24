@@ -1,0 +1,370 @@
+with conversion_data as (
+SELECT 
+    "from" AS from_currency,
+    CAST(argMax(base_rate, created_at) AS Decimal(12,10)) AS rate_in_usd
+FROM datalake.clean_fx_log
+WHERE "to" = 'USD'
+GROUP BY "from"),
+
+
+payout_created AS (
+SELECT payout_id, created_at AS payout_created_at, currency AS payout_currency, account_id, created_by,
+if(upper(currency) = 'BTC',amount / 100000000.0,amount / 100.0) AS payout_amount,
+-- Estimated USD amount
+if(upper(currency) = 'BTC',(amount / 100000000.0) * toFloat64(rate_in_usd),
+if(upper(currency) = 'USD',amount / 100.0,(amount / 100.0) * toFloat64(rate_in_usd))) AS estimated_payout_amount_usd, 
+approved_at
+
+FROM datalake.clean_payout a 
+LEFT JOIN conversion_data b ON upper(a.currency) = upper(b.from_currency)
+-- WHERE created_at >= today() - 90
+)
+-- select * from payout_created order by payout_created_at desc limit 1000
+,
+
+
+account_risk as (
+select account_id, auto_payout_consent, auto_payout_threshold/100.0 as  auto_payout_threshold
+from datalake.clean_account_risk where vendor_payout = 'enabled'
+), 
+
+-- join above two (contains all above)
+account_payout as (
+select a.payout_id, a.payout_created_at, a.account_id, a.payout_amount, a.estimated_payout_amount_usd, a.approved_at,
+b.auto_payout_consent, b.auto_payout_threshold , a.created_by,
+case when auto_payout_consent = 'true' and estimated_payout_amount_usd <= auto_payout_threshold  then 1 else 0 end as can_be_auto_payout
+from payout_created a
+left join account_risk b 
+on a.account_id = b.account_id
+)
+,
+-- select * from account_payout where payout_id = 'pot_coahh0k30hnb6csf5sqg'
+
+
+-- tested above
+    
+all_attempted as (
+select payout_attempt_id, payout_id, provider, updated_by, created_at as payout_attempt_created_at, failure_code, error_code, 
+row_number() over(partition by payout_id order by payout_attempt_created_at asc) as attempt_num,
+row_number() over(partition by payout_id order by payout_attempt_created_at desc) as attempt_num_desc,
+
+status as payout_attempt_status
+-- case when payout_attempt_status = 'reversed' then updated_at end as 'reversed_at'
+from datalake.clean_payout_attempt
+
+WHERE created_at >= today() - 90
+)
+-- select * from account_payout
+,
+
+
+all_payout_and_attempts as (
+select a.payout_id as payout_id, a.payout_created_at, a.account_id, a.payout_amount, a.estimated_payout_amount_usd, a.approved_at,
+a.auto_payout_consent, a.auto_payout_threshold , a.can_be_auto_payout, a.created_by,
+
+b.payout_attempt_id as payout_attempt_id, b.provider, b.payout_attempt_created_at, b.failure_code, b.error_code, 
+b.payout_attempt_status, updated_by , attempt_num, attempt_num_desc
+
+from account_payout a 
+full outer join all_attempted b 
+on a.payout_id = b.payout_id)
+-- select * from all_payout_and_attempts
+,
+
+datamart as (
+select payout_id, payout_attempt_id, transfer_type, txn_source, fund_transfer_network, rate_in_pcy_to_usd, destination_currency, destination_country, psp_reference_id,
+seller_email, business_name
+from datamart_payout
+), 
+
+transition_timeline as(
+SELECT 
+    payout_attempt_id,
+    
+    max(if("to" = 'initiated', created_at, NULL)) AS initiated_at,
+    max(if("to" = 'failed', created_at, NULL)) AS failed_at,
+    max(if("to" = 'processing_retry', created_at, NULL)) AS processing_retry_at,
+    max(if("to" = 'compliance_hold', created_at, NULL)) AS compliance_hold_at,
+    max(if("to" = 'requires_action', created_at, NULL)) AS requires_action_at,
+    max(if("to" = 'succeeded', created_at, NULL)) AS succeeded_at,
+     max(if("to" = 'approved', created_at, NULL)) AS approved_at,
+    max(if("to" = 'processing_retry' or "from" = 'processing_retry', 1, 0)) AS was_in_processing_retry,
+    -- count(if("to" = 'processing_retry' and "from" = 'processing_retry', 1, 0)) AS count_in_processing_retry,
+    sum(if("to" = 'processing_retry', 1, 0)) AS count_of_in_processing_retry,
+    max(if("to" = 'requires_funding' or "from" = 'requires_funding', 1, 0)) AS was_in_requires_funding,
+    max(if("to" = 'initiated', created_by, NULL)) AS initiated_by,
+    
+    -- if(
+    --     argMax(created_by, if("to" = 'succeeded', created_at, toDateTime('1970-01-01'))) in  ('n8n_ops+1@tazapay.com','system'),
+    --     'system',
+    --     'manual'
+    -- ) as success_trigger,
+    
+    -- -- Get created_by for the row with max created_at where "to" = 'processing_retry'
+    -- if(
+    --     argMax(created_by, if("to" = 'processing_retry', created_at, toDateTime('1970-01-01'))) in ('n8n_ops+1@tazapay.com','system'),
+    --     'system',
+    --     'manual'
+    -- ) as processing_retry_trigger,
+    
+    -- -- Get created_by for the row with max created_at where "to" = 'failed'
+    -- if(
+    --     argMax(created_by, if("to" = 'failed', created_at, toDateTime('1970-01-01'))) in ('n8n_ops+1@tazapay.com','system'),
+    --     'system',
+    --     'manual'
+    -- ) as failed_trigger
+    
+    
+    CASE WHEN max("to" = 'succeeded') = 0 THEN NULL
+        WHEN anyIf(created_by, "to" = 'succeeded')
+             IN ('n8n_ops+1@tazapay.com', 'system')
+        THEN 'system'
+        ELSE 'manual'
+    END AS success_trigger,
+
+    -- ===== PROCESSING RETRY TRIGGER (FIXED) =====
+    CASE
+        WHEN max("to" = 'processing_retry') = 0 THEN NULL
+        WHEN anyIf(created_by, "to" = 'processing_retry')
+             IN ('n8n_ops+1@tazapay.com', 'system')
+        THEN 'system'
+        ELSE 'manual'
+    END AS processing_retry_trigger,
+
+    -- ===== FAILED TRIGGER (FIXED) =====
+    CASE
+        WHEN max("to" = 'failed') = 0 THEN NULL
+        WHEN anyIf(created_by, "to" = 'failed')
+             IN ('n8n_ops+1@tazapay.com', 'system')
+        THEN 'system'
+        ELSE 'manual'
+    END AS failed_trigger
+    
+      -- max(if("to" = 'succeeded'and created_at = 'system', "auto", "manual")) end success_trigger,
+FROM datalake.clean_payout_attempt_status_transition
+GROUP BY payout_attempt_id) ,
+
+reversal_data as (
+select payout_id, created_at as reversed_at, reason as reversal_reason 
+from datalake.clean_payout_reversal
+),
+
+
+-- al fine till above 
+
+final as (
+select 
+
+a.payout_id as payout_id, a.payout_attempt_created_at,  a.account_id, a.payout_amount, a.estimated_payout_amount_usd, a.approved_at as approved_at,
+a.auto_payout_consent, a.auto_payout_threshold , a.can_be_auto_payout, a.payout_created_at,
+a.payout_attempt_id as payout_attempt_id, a.provider, a.failure_code, a.error_code, 
+a.payout_attempt_status, a.updated_by,  a.created_by,
+
+ attempt_num,
+ attempt_num_desc,
+
+initiated_at, failed_at, processing_retry_at, compliance_hold_at, requires_action_at,
+succeeded_at, was_in_processing_retry, was_in_requires_funding,  count_of_in_processing_retry,
+success_trigger, processing_retry_trigger, failed_trigger, initiated_by,
+
+transfer_type, txn_source, fund_transfer_network, rate_in_pcy_to_usd, seller_email, business_name, destination_currency,  destination_country, psp_reference_id,
+
+arrayStringConcat(
+    arrayFilter(
+        x -> x != '',
+        array(
+            if(failed_at > succeeded_at , 'failed_to_succeeded', ''),
+            if(count_of_in_processing_retry > 1, 'count_of_in_processing_retry > 1', ''),
+            if(failed_at < approved_at, 'failed_to_approved', ''),
+            if(processing_retry_at > succeeded_at, 'processing_retry_to_succeeded', ''),
+            if(succeeded_at > failed_at, 'succeeded_to_failed', ''),
+            if(processing_retry_at > failed_at, 'processing_retry_to_failed', '')
+        )
+    ),
+    ' - '
+) AS abnormal_state_list,
+
+case when failed_at > succeeded_at   then 'abnormal_state'
+when count_of_in_processing_retry > 1 then 'abnormal_state'
+when failed_at < approved_at then 'abnormal_state'
+when processing_retry_at > succeeded_at then 'abnormal_state'
+when succeeded_at > failed_at then 'abnormal_state'
+when processing_retry_at > failed_at then 'abnormal_state' end as fl_abnormal_state,
+
+ CASE WHEN 
+    (provider = 'yesbank' AND transfer_type = 'local' AND destination_currency IN ('DZD', 'AUD'))
+    OR (provider = 'zamp' AND destination_currency IN ('USDT', 'USDC'))
+    OR (provider = 'fuse' AND transfer_type = 'local' AND destination_currency = 'TRY')
+    OR (provider = 'cellulant' AND transfer_type = 'swift' AND destination_currency = 'EUR')
+    OR (provider = 'yesbank' AND transfer_type = 'swift' AND destination_currency = 'INR')
+    OR (provider in ('na','neo'))
+THEN 0 
+ELSE 1 
+END AS fl_api_integrated,
+
+minIf(succeeded_at, success_trigger = 'system')
+    OVER (PARTITION BY transfer_type, destination_currency, provider)
+AS min_auto_succeeded_at,
+    
+nullIf(if(attempt_num_desc = 1, reversed_at, toDateTime('1970-01-01')), toDateTime('1970-01-01')) AS reversed_at,
+if(attempt_num_desc = 1, reversal_reason, null) as reversal_reason
+
+-- case when can_be_auto_payout = 1 and initiated_by in ('system','n8n_ops+1@tazapay.com') 
+
+
+-- fl_auto_manual_payout_final
+
+
+
+from all_payout_and_attempts a 
+left join transition_timeline b
+on a.payout_attempt_id = b.payout_attempt_id
+left join datamart d on a.payout_id = d.payout_id 
+left join reversal_data e on a.payout_id = e.payout_id
+
+where seller_email not like '%tazapay.com' and seller_email not like '%digitrade.com' 
+-- stp, button click, manual 
+
+)
+-- select * from final limit 10
+
+
+-- all fine till above 
+, 
+
+all as (
+select a.*, 
+-- dateDiff('second',initiated_at, succeeded_at) as success_tat_seconds,
+-- dateDiff('second',initiated_at, failed_at) as failure_tat_seconds,
+-- dateDiff('second',initiated_at, reversed_at) as reversal_tat_seconds,
+-- dateDiff('second', COALESCE(NULLIF(initiated_at, ''), approved_at), succeeded_at) as success_tat_seconds,
+-- dateDiff('second', COALESCE(NULLIF(initiated_at, ''), approved_at), failed_at) as failure_tat_seconds,
+
+-- dateDiff('second', COALESCE(NULLIF(initiated_at, ''), succeeded_at), reversed_at) as reversal_tat_seconds,
+dateDiff('second',  succeeded_at, reversed_at) as reversal_tat_seconds,
+
+CASE 
+  WHEN reversed_at IS NOT NULL AND reversed_at != '' AND updated_by LIKE '%@tazapay.com' THEN 'manual'
+  WHEN reversed_at IS NOT NULL AND reversed_at != '' AND updated_by = 'system' THEN 'system'
+  ELSE NULL
+END as reversal_initiated_by,
+
+
+dateDiff('second', 
+    COALESCE(NULLIF(initiated_at, ''), approved_at), 
+    COALESCE(succeeded_at, processing_retry_at, failed_at)
+) as terminal_state_tat_seconds,
+
+dateDiff('second', 
+     approved_at, 
+    COALESCE(succeeded_at, processing_retry_at, failed_at)
+) as terminal_state_tat_seconds_payout_level,
+
+coalesce(success_trigger, processing_retry_trigger, failed_trigger) as terminal_state_trigger_type,
+
+case when payout_attempt_status = 'reversed' then 'succeeded'
+when succeeded_at <> '' or failed_at <> '' or processing_retry_at <> '' then payout_attempt_status 
+else null end as terminal_status,
+
+
+
+-- v2 
+-- WHEN can_be_auto_payout = 1 AND min_auto_succeeded_at <= succeeded_at AND coalesce(processing_retry_trigger,success_trigger,  failed_trigger) IN ('system','n8n_ops+1@tazapay.com') 
+--   THEN 'system'
+--     WHEN can_be_auto_payout = 0 AND min_auto_succeeded_at <= succeeded_at AND coalesce(processing_retry_trigger,success_trigger,  failed_trigger) IN ('system','n8n_ops+1@tazapay.com')
+--     THEN 'system'
+--     WHEN can_be_auto_payout = 1 AND min_auto_succeeded_at <= succeeded_at AND coalesce( processing_retry_trigger, success_trigger,failed_trigger) NOT IN ('system','n8n_ops+1@tazapay.com') 
+--     THEN 'manual'
+    
+--     WHEN can_be_auto_payout = 1  AND initiated_by NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+--     WHEN can_be_auto_payout = 0  AND initiated_by NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+--     else 
+--     coalesce(success_trigger, processing_retry_trigger, failed_trigger)
+
+
+CASE WHEN  coalesce(processing_retry_trigger,success_trigger,  failed_trigger) IN ('system','n8n_ops+1@tazapay.com')  THEN 'system'
+WHEN  coalesce( processing_retry_trigger, success_trigger,failed_trigger) NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+    
+    WHEN can_be_auto_payout = 1  AND initiated_by NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+    WHEN can_be_auto_payout = 0  AND initiated_by NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+ when updated_by  in ('system','n8n_ops+1@tazapay.com') then 'system' 
+    when updated_by not in ('system','n8n_ops+1@tazapay.com') then 'manual' 
+    END AS fl_payout_inititate_type,
+    -- v1 
+    -- Note: Put the more specific condition (with attempt_num > 1) FIRST
+    -- WHEN can_be_auto_payout = 1 AND min_auto_succeeded_at <= succeeded_at  AND coalesce(processing_retry_trigger,success_trigger , failed_trigger) IN ('system','n8n_ops+1@tazapay.com') 
+    -- AND attempt_num > 1 THEN 'system'
+    -- WHEN can_be_auto_payout = 1 AND min_auto_succeeded_at <= succeeded_at AND coalesce(processing_retry_trigger,success_trigger,  failed_trigger) IN ('system','n8n_ops+1@tazapay.com') 
+    -- and  attempt_num = 1 THEN 'system'
+        
+    -- when payout_attempt_id <> '' and initiated_by is null and (succeeded_at <> '' or failed_at <> '' or was_in_processing_retry = 1) then 'manual'
+    
+    
+    -- WHEN can_be_auto_payout = 0 AND fl_api_integrated = 1 AND initiated_by IN ('system','n8n_ops+1@tazapay.com') THEN 'button_click'
+    
+
+
+CASE 
+
+        WHEN 
+        -- can_be_auto_payout = 1 AND min_auto_succeeded_at <= succeeded_at AND 
+        -- coalesce(processing_retry_trigger,success_trigger,  failed_trigger) IN ('system','n8n_ops+1@tazapay.com') 
+           coalesce(initiated_by, updated_by) IN ('system','n8n_ops+1@tazapay.com') 
+   THEN 'STP'
+    -- WHEN can_be_auto_payout = 0 AND min_auto_succeeded_at <= succeeded_at AND 
+    -- coalesce(processing_retry_trigger,success_trigger,  failed_trigger) IN ('system','n8n_ops+1@tazapay.com')
+    -- THEN 'STP'
+    
+     WHEN can_be_auto_payout = 1 AND min_auto_succeeded_at <= succeeded_at AND 
+       coalesce(initiated_by, updated_by)  NOT IN ('system','n8n_ops+1@tazapay.com')
+    -- coalesce( processing_retry_trigger, success_trigger,failed_trigger) NOT IN ('system','n8n_ops+1@tazapay.com') 
+    THEN 'Button_click'
+    
+    -- WHEN can_be_auto_payout = 0 AND fl_api_integrated = 1 AND initiated_by IN ('system','n8n_ops+1@tazapay.com') THEN 'button_click'
+    
+    WHEN can_be_auto_payout = 1  AND  coalesce(initiated_by, created_by)  NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+    WHEN can_be_auto_payout = 0  AND  coalesce(initiated_by, created_by)  NOT IN ('system','n8n_ops+1@tazapay.com') THEN 'manual'
+    
+    -- when payout_attempt_id <> '' and initiated_by is null and (succeeded_at <> '' or failed_at <> '' or was_in_processing_retry = 1) then 'manual'
+    
+    -- else 
+    -- coalesce(success_trigger, processing_retry_trigger, failed_trigger)
+    -- WHEN can_be_auto_payout = 0 AND fl_api_integrated = 1 AND initiated_by IN ('system','n8n_ops+1@tazapay.com') THEN 'button_click'
+    
+END AS payout_intitiate_flag
+
+
+-- case when min_auto_succeeded_at 
+
+-- some of fl_api_integrated = 1 and initiated_by manual and attempt_num 1,2  to be addressed
+
+from final  a 
+
+),
+
+error_code_mapping_table AS 
+(
+SELECT
+	DISTINCT
+	TRIM(verbose) as final_verbose,
+	tzp_code as tzp_code,
+	TRIM(category) as category,
+	TRIM(tzp_code__v_text) as tzp_code__v_text
+FROM dlt.payout_verbose_details 
+)
+
+select 
+  a.*,
+  CASE
+  	WHEN LENGTH(b.category) = 0 OR b.category IS NULL THEN c.category
+  	ELSE b.category
+  END as error_code_type,
+  CASE
+  	WHEN length(b.final_verbose) = 0 OR b.final_verbose IS NULL THEN c.final_verbose
+  	ELSE b.final_verbose
+  END final_verbose_defined
+from all a 
+LEFT JOIN error_code_mapping_table b
+ON toString(a.error_code) = toString(b.tzp_code)
+LEFT JOIN error_code_mapping_table c
+ON a.failure_code = c.tzp_code__v_text
